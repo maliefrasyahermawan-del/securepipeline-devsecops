@@ -1,0 +1,1187 @@
+================================================================================
+  PANDUAN LENGKAP — SecurePipeline DevSecOps
+  Cara Penggunaan, Fungsi Setiap Alat, dan Arsitektur Pipeline
+================================================================================
+
+Dibuat untuk: Portfolio Project Cyber Security — Project 8
+Platform     : Windows 11 + GitHub Actions (cloud)
+Tanggal      : 2026-06-30
+
+================================================================================
+  DAFTAR ISI
+================================================================================
+
+  1.  Apa Itu SecurePipeline?
+  2.  Konsep Dasar DevSecOps
+  3.  Arsitektur Pipeline — Gambaran Besar
+  4.  Penjelasan Setiap Stage
+  5.  Penjelasan Setiap Alat Keamanan
+       5.1  Gitleaks
+       5.2  Semgrep
+       5.3  OWASP Dependency Check
+       5.4  Trivy
+       5.5  OWASP ZAP
+       5.6  aggregate_results.py
+  6.  Penjelasan File-File Project
+  7.  Cara Setup dari Nol (Step-by-Step)
+  8.  Cara Menjalankan Pipeline
+  9.  Cara Membaca Hasil Scan
+  10. Alur Demo: Melihat Pipeline Bekerja
+  11. Cara Memperbaiki Setiap Jenis Temuan
+  12. Perintah Berguna untuk Testing Lokal
+  13. Troubleshooting Masalah Umum
+  14. Glossary / Istilah Penting
+
+================================================================================
+  1. APA ITU SECUREPIPELINE?
+================================================================================
+
+SecurePipeline adalah sistem CI/CD (Continuous Integration / Continuous
+Delivery) yang dilengkapi dengan lapisan keamanan otomatis. Setiap kali
+developer melakukan "git push" ke GitHub, sistem ini secara otomatis:
+
+  - Memeriksa seluruh kode sumber untuk menemukan celah keamanan
+  - Memeriksa semua library/package yang digunakan untuk menemukan CVE
+  - Membangun Docker image dan memindai isinya
+  - Menjalankan aplikasi di lingkungan staging dan melakukan pengujian dinamis
+  - Mengumpulkan semua hasil scan dan membuat laporan terpadu
+  - MEMBLOKIR deployment secara otomatis jika ditemukan celah CRITICAL atau HIGH
+
+Project ini juga menyertakan sebuah aplikasi FastAPI (Python) yang SENGAJA
+dibuat memiliki celah keamanan, agar kita bisa melihat secara langsung
+bagaimana pipeline mendeteksi dan melaporkannya.
+
+Tujuan utama project ini (untuk portfolio):
+  - Menunjukkan kemampuan mengintegrasikan keamanan ke dalam pipeline CI/CD
+  - Mendemonstrasikan penggunaan 5 kategori tools keamanan yang berbeda
+  - Membuktikan pemahaman tentang OWASP Top 10 dan jenis-jenis kerentanan
+  - Menunjukkan kemampuan membaca dan menginterpretasikan laporan keamanan
+
+================================================================================
+  2. KONSEP DASAR DEVSECOPS
+================================================================================
+
+DevSecOps = Development + Security + Operations
+
+Pendekatan tradisional:
+  [Dev] --> [Ops] --> [Security audit manual] --> [Fix] --> [Deploy]
+           (masalah keamanan baru ditemukan di akhir, mahal diperbaiki)
+
+Pendekatan DevSecOps:
+  [Dev] --> [Security scan otomatis] --> [Ops] --> [Deploy]
+           (masalah ditemukan lebih awal, lebih murah diperbaiki)
+
+Prinsip "Shift Left Security":
+  Keamanan digeser ke KIRI dalam pipeline, artinya dijalankan lebih awal,
+  bahkan sebelum kode di-build. Ini mengurangi biaya perbaikan karena
+  menemukan bug saat pengembangan jauh lebih murah daripada setelah produksi.
+
+Dalam SecurePipeline, urutan scan adalah:
+  Kode ditulis --> Gitleaks (secrets) --> Semgrep (kode) --> DepCheck (library)
+  --> Docker build --> Trivy (container) --> Deploy staging --> ZAP (runtime)
+
+================================================================================
+  3. ARSITEKTUR PIPELINE — GAMBARAN BESAR
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                        DEVELOPER WORKSTATION                            │
+  │   git push / git pull request                                           │
+  └─────────────────────────────────┬───────────────────────────────────────┘
+                                    │  trigger otomatis
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                         GITHUB ACTIONS RUNNER                           │
+  │              (virtual machine Ubuntu di cloud GitHub, GRATIS)           │
+  │                                                                         │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │  STAGE 1 — PRE-BUILD SECURITY SCAN           Job: pre-build-scan│   │
+  │  │                                                                  │   │
+  │  │  Step 1: Checkout code (ambil semua file dari GitHub)           │   │
+  │  │  Step 2: GITLEAKS → cari hardcoded secrets di git history       │   │
+  │  │           Output: jika FAIL → pipeline BERHENTI di sini         │   │
+  │  │  Step 3: SEMGREP  → analisis statis kode Python                 │   │
+  │  │           Output: scan-results/semgrep.json                     │   │
+  │  │  Step 4: OWASP DEPENDENCY CHECK → cek CVE di requirements.txt  │   │
+  │  │           Output: scan-results/dependency-check-report.json     │   │
+  │  │  Step 5: Evaluasi → set flag has-critical jika ada HIGH/CRIT    │   │
+  │  └─────────────────────────────┬────────────────────────────────────┘  │
+  │                                │  needs: pre-build-scan                  │
+  │                                ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │  STAGE 2 — BUILD + CONTAINER SCAN        Job: build-and-scan    │   │
+  │  │                                                                  │   │
+  │  │  Step 1: docker build → buat image dari Dockerfile              │   │
+  │  │  Step 2: TRIVY image scan → cek CVE di dalam image layer        │   │
+  │  │           Output: scan-results/trivy-report.json                │   │
+  │  │  Step 3: TRIVY config scan → cek masalah di Dockerfile          │   │
+  │  │           Output: scan-results/trivy-config.json                │   │
+  │  │  Step 4: Evaluasi → set flag has-critical jika ada CVE CRITICAL │   │
+  │  └─────────────────────────────┬────────────────────────────────────┘  │
+  │                                │  needs: build-and-scan                  │
+  │                                ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │  STAGE 3 — STAGING + DAST              Job: staging-and-dast    │   │
+  │  │                                                                  │   │
+  │  │  Step 1: docker run → jalankan app di port 8000                 │   │
+  │  │  Step 2: Tunggu app siap (retry curl /health hingga 15x)        │   │
+  │  │  Step 3: OWASP ZAP → scan app yang sedang berjalan              │   │
+  │  │           Output: scan-results/zap-report.json                  │   │
+  │  │  Step 4: docker stop → matikan staging container                │   │
+  │  └─────────────────────────────┬────────────────────────────────────┘  │
+  │                                │  needs: semua stage (if: always())      │
+  │                                ▼                                         │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │  FINAL — AGGREGATE REPORT               Job: security-report    │   │
+  │  │                                                                  │   │
+  │  │  Step 1: Download semua artifact JSON dari stage 1,2,3          │   │
+  │  │  Step 2: aggregate_results.py → baca & normalise semua JSON     │   │
+  │  │  Step 3: Tulis security-summary.json (laporan terpadu)          │   │
+  │  │  Step 4: Post komentar ke Pull Request (jika event = PR)        │   │
+  │  │  Step 5: Kirim notifikasi Slack (jika SLACK_WEBHOOK diset)      │   │
+  │  │  Step 6: Upload semua artifact (retensi 30 hari)                │   │
+  │  │  Step 7: GATE → exit code 1 jika ada CRITICAL atau HIGH         │   │
+  │  └──────────────────────────────────────────────────────────────────┘  │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Hasil akhir:
+  - Pipeline MERAH (❌) → ada CRITICAL/HIGH → deployment DIBLOKIR
+  - Pipeline HIJAU (✅) → semua gate lulus → deployment diizinkan
+
+================================================================================
+  4. PENJELASAN SETIAP STAGE
+================================================================================
+
+  STAGE 1 — PRE-BUILD SECURITY SCAN
+  ─────────────────────────────────
+  Mengapa pertama?
+    Karena ini paling murah dan paling cepat. Tidak perlu build dulu.
+    Menemukan masalah di stage ini berarti hemat waktu 5-15 menit
+    dibanding kalau ditemukan di stage 2 atau 3.
+
+  Yang terjadi:
+    - Kode di-checkout dari GitHub ke virtual machine Actions
+    - Gitleaks membaca SELURUH git history (bukan hanya commit terakhir)
+    - Semgrep membaca file .py dan mencari pattern berbahaya
+    - OWASP DepCheck membaca requirements.txt dan mencocokkan dengan
+      database CVE nasional (NVD - National Vulnerability Database)
+
+  Kapan stage ini GAGAL?
+    - Gitleaks menemukan secret/password hardcoded → LANGSUNG STOP
+    - Semgrep menemukan SQL injection atau celah keamanan kelas ERROR
+    - DepCheck menemukan CVE HIGH atau CRITICAL di package yang digunakan
+
+  ─────────────────────────────────────────────────────────────────────────
+
+  STAGE 2 — BUILD + CONTAINER SCAN
+  ─────────────────────────────────
+  Mengapa kedua?
+    Docker image baru bisa di-scan setelah di-build. Stage ini memastikan
+    image yang akan di-deploy bebas dari kerentanan yang diketahui.
+
+  Yang terjadi:
+    - `docker build` berjalan menggunakan Dockerfile di root folder
+    - Trivy mengunduh vulnerability database dan mencocokkan setiap
+      package dalam image (OS packages + Python packages) dengan CVE
+    - Trivy juga membaca Dockerfile dan mencari misconfiguration
+      (contoh: menjalankan sebagai root, tidak ada HEALTHCHECK, dll)
+
+  Kapan stage ini GAGAL?
+    - Trivy menemukan CVE dengan severity CRITICAL dalam image
+    - Trivy config scan menemukan misconfiguration HIGH/CRITICAL
+
+  ─────────────────────────────────────────────────────────────────────────
+
+  STAGE 3 — STAGING DEPLOY + DAST
+  ────────────────────────────────
+  Mengapa ketiga?
+    DAST (Dynamic Application Security Testing) hanya bisa berjalan
+    terhadap aplikasi yang SEDANG BERJALAN. Stage ini mensimulasikan
+    lingkungan produksi di dalam GitHub Actions runner.
+
+  Yang terjadi:
+    - Docker image dijalankan di port 8000 pada Actions runner
+    - Pipeline menunggu hingga endpoint /health merespons (max 45 detik)
+    - OWASP ZAP mengirim ribuan request HTTP ke aplikasi, menganalisis
+      response, dan mencari celah keamanan runtime
+    - Container dihentikan setelah scan selesai
+
+  Kapan stage ini GAGAL?
+    - Aplikasi tidak mau start (error di startup, port conflict)
+    - ZAP menemukan HIGH/CRITICAL (continue-on-error=true, tidak block)
+
+  Catatan: ZAP diset `continue-on-error: true` karena ZAP "baseline scan"
+  memang banyak false positive. Hasilnya dicatat tapi tidak memblokir pipeline.
+
+  ─────────────────────────────────────────────────────────────────────────
+
+  FINAL JOB — AGGREGATE REPORT
+  ──────────────────────────────
+  Mengapa ada job terpisah?
+    Karena setiap job berjalan di virtual machine terpisah dan tidak
+    bisa mengakses file dari job lain secara langsung. Job final
+    mendownload semua artifact, lalu menyatukan semuanya.
+
+  Yang terjadi:
+    - Download artifact dari stage 1, 2, 3
+    - Jalankan aggregate_results.py
+    - Tulis security-summary.json
+    - Post PR comment (jika event adalah pull_request)
+    - Kirim Slack (jika secret SLACK_WEBHOOK ada)
+    - PIPELINE GATE: exit 1 jika critical > 0 atau high > 0
+
+================================================================================
+  5. PENJELASAN SETIAP ALAT KEAMANAN
+================================================================================
+
+  ════════════════════════════════════════════════════════════════════════
+  5.1  GITLEAKS
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu Gitleaks?
+    Gitleaks adalah alat open-source untuk mendeteksi secrets (rahasia)
+    yang ter-hardcode dalam kode sumber dan git history.
+
+  Fungsi:
+    Memindai seluruh riwayat commit Git untuk menemukan:
+    - API keys (AWS, Google Cloud, Stripe, dll)
+    - Password yang ditulis langsung di kode
+    - Private keys (SSH, PGP, SSL certificates)
+    - Database connection strings dengan credential
+    - Token akses (GitHub token, Slack token, dll)
+    - Secrets dalam environment variables yang di-commit
+
+  Cara kerja:
+    Gitleaks menggunakan regex patterns untuk mencocokkan string dalam
+    setiap commit, setiap file, di setiap branch. Database rule-nya
+    mencakup 100+ jenis secret dari berbagai provider.
+
+  File konfigurasi: .gitleaks.toml
+    - [extend] useDefault = true  → gunakan semua rule bawaan Gitleaks
+    - [[rules]]                   → tambah rule custom (misal: DB_PASSWORD)
+    - [allowlist] regexes         → whitelist pattern yang boleh diabaikan
+    - [allowlist] paths           → folder yang tidak perlu di-scan
+
+  Contoh yang akan terdeteksi di project ini:
+    app/main.py baris: DB_PASSWORD = "supersecret123"
+    app/main.py baris: SECRET_TOKEN = "ghp_FAKETOKEN1234567890..."
+
+  Cara fix:
+    1. Hapus nilai hardcoded dari kode
+    2. Tambahkan nilai tersebut ke GitHub Secrets
+    3. Baca via os.getenv("NAMA_SECRET") di kode
+    4. PENTING: Nilai yang sudah ter-commit harus DIROTASI karena
+       sudah tersimpan di git history dan berpotensi bocor
+
+  Severity output: Gitleaks tidak memakai CRITICAL/HIGH/MEDIUM.
+    Setiap temuan dianggap HIGH oleh aggregator kita.
+
+  ════════════════════════════════════════════════════════════════════════
+  5.2  SEMGREP
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu Semgrep?
+    Semgrep adalah alat SAST (Static Application Security Testing) yang
+    menganalisis STRUKTUR kode (bukan hanya teks) menggunakan pattern
+    matching yang memahami sintaks bahasa pemrograman.
+
+  Fungsi:
+    Menemukan bug keamanan dalam kode sumber tanpa menjalankan kode:
+    - SQL Injection (string concatenation ke query SQL)
+    - Cross-Site Scripting / XSS (output unsanitized ke HTML)
+    - Path Traversal (user input digabung ke file path)
+    - Missing authentication (endpoint tanpa auth guard)
+    - Insecure deserialization (pickle.loads dari input tak dipercaya)
+    - Hardcoded credentials dalam kode
+    - Penggunaan fungsi kriptografi yang lemah (MD5, SHA1, dll)
+
+  Cara kerja:
+    Semgrep mem-parse kode menjadi AST (Abstract Syntax Tree) lalu
+    mencocokkan pattern yang didefinisikan dalam rule. Karena berbasis
+    AST, Semgrep tidak tertipu oleh whitespace, komentar, atau nama
+    variabel yang berbeda.
+
+  Ruleset yang digunakan di pipeline:
+    - p/python         → aturan umum untuk Python
+    - p/security-audit → audit keamanan umum
+    - p/owasp-top-ten  → aturan berbasis OWASP Top 10
+    - .semgrep.yml     → aturan CUSTOM yang kita buat sendiri
+
+  File konfigurasi: .semgrep.yml
+    Berisi 6 rule custom:
+    1. fastapi-missing-auth-dependency → endpoint /admin tanpa Depends()
+    2. sqlite3-string-format-sqli      → f-string dalam .execute()
+    3. string-concat-sqli              → "..." + var + "..." dalam .execute()
+    4. plaintext-password-comparison   → password dibanding tanpa hash
+    5. unrestricted-file-upload        → upload tanpa cek content_type
+    6. os-path-join-user-input         → path traversal via filename
+
+  Output: scan-results/semgrep.json
+    Format: { "results": [ { "check_id", "path", "start.line",
+              "extra": { "severity", "message" } } ] }
+
+  Severity: ERROR = HIGH, WARNING = MEDIUM, INFO = LOW (dalam Semgrep)
+
+  ════════════════════════════════════════════════════════════════════════
+  5.3  OWASP DEPENDENCY CHECK
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu OWASP Dependency Check?
+    Alat SCA (Software Composition Analysis) yang memeriksa library
+    dan package yang digunakan oleh aplikasi, lalu mencocokkannya
+    dengan database CVE (Common Vulnerabilities and Exposures) yang
+    dipublish oleh NIST (National Institute of Standards and Technology).
+
+  Fungsi:
+    Menemukan package yang memiliki kerentanan yang sudah diketahui
+    publik. Setiap CVE punya score CVSS (0-10) yang menentukan severity.
+    Contoh: CVE-2021-25215 di Pillow 8.2.0 memiliki score CVSS 9.8 (CRITICAL)
+
+  Cara kerja:
+    1. Baca requirements.txt dan identifikasi setiap package + versinya
+    2. Unduh (atau gunakan cache) NVD vulnerability database
+    3. Cocokkan setiap package dengan entri di database CVE
+    4. Hasilkan laporan dengan daftar CVE yang berlaku
+
+  Package vulnerable yang ada di project ini (by design):
+    - fastapi==0.68.0     → versi sangat lama, beberapa security fixes terlewat
+    - uvicorn==0.14.0     → versi lama
+    - requests==2.25.0    → CVE-2021-33503 (ReDoS vulnerability)
+    - Pillow==8.2.0       → BANYAK CVE termasuk beberapa CRITICAL
+                            (CVE-2021-25287, CVE-2021-25288, dll)
+    - pydantic==1.8.0     → versi lama
+
+  Output: scan-results/dependency-check-report.json
+    Format: { "dependencies": [ { "fileName", "vulnerabilities": [
+              { "name" (CVE-ID), "severity", "description" } ] } ] }
+
+  ════════════════════════════════════════════════════════════════════════
+  5.4  TRIVY
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu Trivy?
+    Trivy adalah vulnerability scanner komprehensif untuk container,
+    filesystem, git repository, dan IaC (Infrastructure as Code).
+    Dibuat oleh Aqua Security, open-source, sangat cepat.
+
+  Fungsi (dua mode yang dipakai di pipeline):
+
+    MODE 1 — Image scan:
+      Memindai Docker image yang sudah di-build untuk menemukan CVE di:
+      - OS packages (apt packages dalam base image python:3.11-slim)
+      - Python packages yang diinstall via pip
+      Mendeteksi CVE berdasarkan versi package vs database vulnerability
+
+    MODE 2 — Config scan:
+      Membaca Dockerfile dan file konfigurasi IaC untuk menemukan:
+      - Dockerfile: menjalankan sebagai root (tidak ada USER directive)
+      - Dockerfile: tidak ada HEALTHCHECK
+      - Dockerfile: COPY dengan wildcard berbahaya
+      - Privilege escalation risks
+      - Exposed sensitive ports
+
+  Cara kerja:
+    Trivy memiliki vulnerability database sendiri yang diupdate setiap hari.
+    Saat scan image, Trivy membaca manifest layer image, mengidentifikasi
+    semua package yang terinstall, lalu mencocokkan dengan database CVE.
+
+  Intentional issues di project ini:
+    1. Dockerfile tidak punya "USER appuser" → Trivy flag:
+       "Container should not run as root"
+    2. Dockerfile tidak punya "HEALTHCHECK" → Trivy flag:
+       "No HEALTHCHECK defined"
+    3. Pillow 8.2.0 → Trivy akan mendeteksi CVE yang sama dengan DepCheck
+
+  Output:
+    scan-results/trivy-report.json → hasil image scan
+    scan-results/trivy-config.json → hasil config/Dockerfile scan
+
+  Format: { "Results": [ { "Target", "Vulnerabilities": [ { "VulnerabilityID",
+            "Severity", "Description", "Title" } ], "Misconfigurations": [...] } ] }
+
+  ════════════════════════════════════════════════════════════════════════
+  5.5  OWASP ZAP (Zed Attack Proxy)
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu OWASP ZAP?
+    ZAP adalah alat DAST (Dynamic Application Security Testing) open-source
+    yang paling populer. Berbeda dengan SAST yang membaca kode, ZAP
+    BERINTERAKSI langsung dengan aplikasi yang sedang berjalan — persis
+    seperti yang dilakukan penyerang nyata.
+
+  Fungsi:
+    Menemukan celah keamanan runtime dengan mengirim request HTTP nyata:
+    - Missing security headers (X-Content-Type-Options, HSTS, dll)
+    - Cross-Site Scripting (XSS) — mencoba inject script via parameter
+    - SQL Injection — mencoba payload SQLi via form/URL parameter
+    - CORS misconfiguration
+    - Cookie tanpa flag HttpOnly atau Secure
+    - Information disclosure (stack trace, version info di response)
+    - Open redirect vulnerability
+    - Server-Side Request Forgery (SSRF)
+
+  Mode yang digunakan: "Baseline scan"
+    - Mode paling ringan dan cepat (beberapa menit)
+    - Hanya melakukan passive scan + beberapa active probe dasar
+    - Tidak melakukan brute force atau destructive testing
+    - Cocok untuk CI/CD karena tidak terlalu merusak environment
+
+  Cara kerja di pipeline:
+    1. Aplikasi dijalankan di Docker pada port 8000
+    2. Pipeline menunggu /health endpoint merespons
+    3. ZAP diarahkan ke http://localhost:8000
+    4. ZAP crawl semua endpoint yang bisa ditemukan
+    5. ZAP mengirim berbagai payload uji ke setiap endpoint
+    6. ZAP menganalisis response dan mengidentifikasi anomali
+    7. Laporan dihasilkan dalam format JSON
+
+  Output: scan-results/zap-report.json
+    Format: { "site": [ { "alerts": [ { "pluginid", "name", "riskdesc",
+              "desc", "url", "solution" } ] } ] }
+
+  Catatan penting:
+    ZAP sering menghasilkan false positive (temuan yang sebenarnya
+    tidak berbahaya). Oleh karena itu pipeline menggunakan:
+    continue-on-error: true → ZAP tidak memblokir pipeline
+    Hasilnya tetap dikumpulkan dan dilaporkan, tapi tidak menjadi gate.
+
+  ════════════════════════════════════════════════════════════════════════
+  5.6  aggregate_results.py
+  ════════════════════════════════════════════════════════════════════════
+
+  Apa itu aggregate_results.py?
+    Script Python custom yang kita buat sebagai "jembatan" antara
+    semua scanner. Setiap scanner memiliki format JSON output yang
+    berbeda-beda, dan script ini menormalkan semuanya ke satu format.
+
+  Fungsi:
+    1. Baca semua file JSON dari folder scan-results/
+    2. Parse setiap format (semgrep, trivy, zap, depcheck, gitleaks)
+    3. Normalkan ke schema unified:
+       { scanner, finding_id, severity, file, line, description, cve }
+    4. Hitung total temuan per severity
+    5. Tulis security-summary.json
+    6. Print tabel ASCII ke log GitHub Actions
+    7. Return exit code 1 jika ada CRITICAL atau HIGH
+
+  Schema unified yang dihasilkan:
+    {
+      "passed": true/false,
+      "total_findings": 12,
+      "critical": 2,
+      "high": 4,
+      "medium": 5,
+      "low": 1,
+      "info": 0,
+      "scanners": {
+        "semgrep": { "status": "ok", "findings": 3, "by_severity": {...} },
+        "trivy-report": { "status": "ok", "findings": 7 },
+        "dependency-check-report": { "status": "ok", "findings": 2 },
+        "zap-report": { "status": "not_run", "findings": 0 },
+        "gitleaks-report": { "status": "ok", "findings": 1 }
+      },
+      "findings": [
+        {
+          "scanner": "semgrep",
+          "finding_id": "sqlite3-string-format-sqli",
+          "severity": "HIGH",
+          "file": "app/database.py",
+          "line": 42,
+          "description": "SQL injection via f-string in .execute()",
+          "cve": null
+        },
+        ...
+      ]
+    }
+
+  Cara jalankan lokal:
+    python scripts/aggregate_results.py --results-dir scan-results --output summary.json
+
+================================================================================
+  6. PENJELASAN FILE-FILE PROJECT
+================================================================================
+
+  securepipeline/
+  │
+  ├── .github/workflows/devsecops.yml
+  │   FUNGSI: Definisi utama pipeline GitHub Actions.
+  │   Berisi: 4 jobs (pre-build-scan, build-and-scan, staging-and-dast,
+  │   security-report), semua step, semua tool, upload artifact, PR comment,
+  │   Slack notification, dan pipeline gate di akhir.
+  │   PENTING: File ini yang "mengorkestrasi" semua alat.
+  │
+  ├── app/main.py
+  │   FUNGSI: Aplikasi FastAPI yang sengaja vulnerable.
+  │   Endpoint: /health, /users, /users/{id}, /login, /admin, /upload
+  │   Berisi intentional vulnerabilities yang ditandai dengan komentar
+  │   "# INTENTIONAL VULNERABILITY: [type]"
+  │
+  ├── app/database.py
+  │   FUNGSI: Handler koneksi SQLite dengan SQL injection.
+  │   get_user_by_id_vulnerable() → SQL injection via f-string
+  │   get_user_by_credentials()   → plain-text password comparison
+  │
+  ├── app/models.py
+  │   FUNGSI: Pydantic models untuk request/response validation FastAPI.
+  │   Tidak ada vulnerability di sini.
+  │
+  ├── app/requirements.txt
+  │   FUNGSI: Daftar Python package dependencies.
+  │   SENGAJA menggunakan versi lama yang punya CVE:
+  │   - Pillow==8.2.0  → target utama Dependency Check & Trivy
+  │   - fastapi==0.68.0 → versi sangat lama
+  │
+  ├── Dockerfile
+  │   FUNGSI: Instruksi untuk membangun Docker image.
+  │   SENGAJA tanpa USER directive (run as root) → target Trivy config scan
+  │   SENGAJA tanpa HEALTHCHECK                 → target Trivy config scan
+  │
+  ├── .dockerignore
+  │   FUNGSI: Daftar file yang tidak ikut di-copy ke Docker build context.
+  │   Mencegah file test, script, dan config ikut masuk ke image.
+  │
+  ├── .gitleaks.toml
+  │   FUNGSI: Konfigurasi untuk Gitleaks.
+  │   Berisi: custom rules tambahan, allowlist path, allowlist regex.
+  │
+  ├── .semgrep.yml
+  │   FUNGSI: Custom rules Semgrep yang kita buat sendiri.
+  │   Berisi: 6 rule untuk FastAPI-specific vulnerabilities.
+  │
+  ├── scripts/aggregate_results.py
+  │   FUNGSI: Agregator semua hasil scan.
+  │   Input:  scan-results/*.json
+  │   Output: security-summary.json + ASCII table di log
+  │
+  ├── tests/test_main.py
+  │   FUNGSI: Test suite pytest untuk API endpoints.
+  │   Mendokumentasikan behavior yang diharapkan (termasuk yang vulnerable).
+  │   Dijalankan sebelum deploy untuk memastikan app bisa start.
+  │
+  └── README.md
+      FUNGSI: Dokumentasi project dalam format Markdown.
+      Berisi: setup guide, architecture, cara baca hasil, cara fix.
+
+================================================================================
+  7. CARA SETUP DARI NOL (STEP-BY-STEP)
+================================================================================
+
+  PRASYARAT (semua sudah ada di Windows 11):
+    - Git (https://git-scm.com/download/win)
+    - Docker Desktop (https://www.docker.com/products/docker-desktop)
+    - Python 3.11 (https://www.python.org/downloads/)
+    - Akun GitHub (https://github.com)
+    - GitHub CLI opsional (https://cli.github.com)
+
+  LANGKAH 1: Buat Repository di GitHub
+  ─────────────────────────────────────
+  a. Buka https://github.com/new
+  b. Nama repo: securepipeline
+  c. Visibility: Public (agar Actions gratis)
+  d. Jangan centang "Initialize with README" (kita sudah punya)
+  e. Klik "Create repository"
+
+  LANGKAH 2: Push Project ke GitHub
+  ─────────────────────────────────────
+  Buka PowerShell atau Command Prompt, jalankan:
+
+    cd "D:\Portofolio Cyber Alif\Project 8 - Secure pipeline\securepipeline"
+
+    git init
+    git add .
+    git commit -m "feat: initial SecurePipeline DevSecOps project"
+    git branch -M main
+    git remote add origin https://github.com/USERNAME_KAMU/securepipeline.git
+    git push -u origin main
+
+  Ganti USERNAME_KAMU dengan username GitHub kamu.
+
+  LANGKAH 3: Verifikasi Pipeline Berjalan
+  ─────────────────────────────────────
+  a. Buka repo di GitHub
+  b. Klik tab "Actions"
+  c. Kamu akan melihat workflow "SecurePipeline — DevSecOps CI/CD" berjalan
+  d. Klik workflow tersebut untuk melihat progress
+
+  LANGKAH 4: Setup Secrets (Opsional)
+  ─────────────────────────────────────
+  Jika ingin notifikasi Slack:
+  a. Buka repo → Settings → Secrets and variables → Actions
+  b. Klik "New repository secret"
+  c. Name: SLACK_WEBHOOK
+     Value: https://hooks.slack.com/services/XXXX/YYYY/ZZZZ
+             (dapatkan dari Slack app → Incoming Webhooks)
+
+  Jika ingin Gitleaks licensed features:
+  a. Name: GITLEAKS_LICENSE
+     Value: [license key dari gitleaks.io]
+  b. Tanpa license, Gitleaks tetap berjalan dengan fitur terbatas
+
+================================================================================
+  8. CARA MENJALANKAN PIPELINE
+================================================================================
+
+  OTOMATIS (recommended):
+  ─────────────────────────
+  Pipeline berjalan otomatis setiap kali ada:
+  - git push ke branch manapun
+  - Pull Request yang dibuat atau diupdate ke branch main/master/develop
+
+  Untuk trigger manual:
+  a. Buka repo GitHub → tab Actions
+  b. Klik workflow "SecurePipeline — DevSecOps CI/CD"
+  c. Klik "Run workflow" → pilih branch → klik "Run workflow"
+
+  LOKAL (tanpa GitHub Actions):
+  ─────────────────────────────
+  Untuk menjalankan app saja:
+    cd "D:\Portofolio Cyber Alif\Project 8 - Secure pipeline\securepipeline"
+    pip install -r app/requirements.txt
+    python -m uvicorn app.main:app --reload --port 8000
+
+  Untuk menjalankan test:
+    pip install pytest httpx
+    pytest tests/ -v
+
+  Untuk menjalankan Semgrep lokal (butuh pip install semgrep):
+    semgrep --config p/python --config .semgrep.yml app/ --verbose
+
+  Untuk menjalankan Gitleaks lokal (butuh install Gitleaks):
+    gitleaks detect --config .gitleaks.toml --source . -v
+
+  Untuk build dan scan Docker image lokal (butuh Docker Desktop):
+    docker build -t securepipeline-app:local .
+    trivy image securepipeline-app:local
+
+  Untuk menjalankan aggregator:
+    mkdir scan-results
+    # (taruh file JSON dari scanner di scan-results/)
+    python scripts/aggregate_results.py
+
+================================================================================
+  9. CARA MEMBACA HASIL SCAN
+================================================================================
+
+  DI GITHUB ACTIONS (online):
+  ─────────────────────────────
+  1. Buka tab "Actions" di repo
+  2. Klik workflow run yang ingin dilihat
+  3. Di sebelah kiri, ada daftar jobs:
+     - "Stage 1 — Pre-Build Security"
+     - "Stage 2 — Build & Container Scan"
+     - "Stage 3 — Staging & DAST"
+     - "Final — Aggregate Security Report"
+  4. Klik setiap job untuk melihat log detail per step
+  5. Di bagian bawah halaman workflow run, ada section "Artifacts":
+     - stage1-pre-build-reports   → semgrep.json, dependency-check-report.json
+     - stage2-container-reports   → trivy-report.json, trivy-config.json
+     - stage3-dast-reports        → zap-report.json
+     - security-summary           → security-summary.json (laporan terpadu)
+  6. Download artifact dengan klik nama artifact → file ZIP akan terdownload
+
+  MEMBACA security-summary.json:
+  ─────────────────────────────
+  Field utama yang paling penting:
+    "passed"         → true berarti tidak ada CRITICAL/HIGH
+                       false berarti deployment diblokir
+    "total_findings" → total semua temuan dari semua scanner
+    "critical"       → jumlah temuan severity CRITICAL
+    "high"           → jumlah temuan severity HIGH
+    "medium"         → jumlah temuan severity MEDIUM (tidak blok)
+    "low"            → jumlah temuan severity LOW (tidak blok)
+    "scanners"       → status dan jumlah temuan per scanner
+    "findings"       → array semua temuan detail dengan info lengkap
+
+  Contoh temuan dalam "findings":
+    {
+      "scanner": "semgrep",
+      "finding_id": "sqlite3-string-format-sqli",
+      "severity": "HIGH",
+      "file": "app/database.py",
+      "line": 35,
+      "description": "Possible SQL injection: f-string in .execute()",
+      "cve": null
+    }
+
+  Cara interpretasi severity:
+    CRITICAL → Eksploitasi sangat mudah, dampak sangat besar → WAJIB FIX
+    HIGH     → Eksploitasi memungkinkan, dampak signifikan → WAJIB FIX
+    MEDIUM   → Eksploitasi lebih sulit atau dampak terbatas → Direkomendasikan fix
+    LOW      → Dampak minimal → Fix jika ada waktu
+    INFO     → Informatif saja → Tidak perlu action
+
+  DI PULL REQUEST (jika event adalah PR):
+  ─────────────────────────────────────
+  Bot GitHub Actions akan otomatis post komentar di PR berisi:
+    - Status: PASSED atau FAILED
+    - Tabel severity count
+    - Breakdown per scanner
+  Ini memudahkan code review karena info keamanan langsung di PR.
+
+================================================================================
+  10. ALUR DEMO: MELIHAT PIPELINE BEKERJA
+================================================================================
+
+  Ikuti alur ini untuk melihat setiap gate bekerja satu per satu.
+
+  ──────────────────────────────────────────────────────────────────
+  PUSH 1 — Pipeline merah karena Gitleaks (secrets)
+  ──────────────────────────────────────────────────────────────────
+
+  Kondisi: Push project apa adanya (ada hardcoded secrets di main.py)
+
+  Yang terjadi:
+    Stage 1, Step Gitleaks:
+    - Menemukan: SECRET_TOKEN = "ghp_FAKETOKEN1234567890..."
+    - Menemukan: DB_PASSWORD = "supersecret123"
+    - Gitleaks exit dengan code 1
+    - Stage 1 GAGAL → Stage 2 tidak jalan
+
+  Hasil: Pipeline merah ❌
+
+  Fix yang harus dilakukan:
+    Edit app/main.py:
+      HAPUS:  AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
+      HAPUS:  DB_PASSWORD = "supersecret123"
+      HAPUS:  SECRET_TOKEN = "ghp_FAKETOKEN1234567890..."
+      TAMBAH: AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "")
+      TAMBAH: DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+
+  ──────────────────────────────────────────────────────────────────
+  PUSH 2 — Pipeline merah karena Semgrep (SQL injection)
+  ──────────────────────────────────────────────────────────────────
+
+  Kondisi: Secrets sudah dihapus, tapi SQL injection masih ada
+
+  Yang terjadi:
+    Stage 1, Step Semgrep:
+    - Menemukan: database.py baris ~35: f"SELECT ... WHERE id = {user_id}"
+    - Severity: ERROR (= HIGH dalam aggregator kita)
+    - Custom rule "sqlite3-string-format-sqli" dari .semgrep.yml trigger
+
+  Hasil: Pipeline merah ❌ (gate final blokir karena ada HIGH)
+
+  Fix:
+    Edit app/database.py, fungsi get_user_by_id_vulnerable():
+      HAPUS:  query = f"SELECT ... WHERE id = {user_id}"
+              rows = conn.execute(query).fetchall()
+      TAMBAH: rows = conn.execute(
+                  "SELECT id, username, email, role FROM users WHERE id = ?",
+                  (user_id,)
+              ).fetchall()
+
+  ──────────────────────────────────────────────────────────────────
+  PUSH 3 — Pipeline merah karena Trivy (CVE di Pillow 8.2.0)
+  ──────────────────────────────────────────────────────────────────
+
+  Kondisi: Kode bersih, tapi requirements.txt masih Pillow==8.2.0
+
+  Yang terjadi:
+    Stage 2, Trivy image scan:
+    - Menemukan: Pillow 8.2.0 → CVE-2021-25287 (CRITICAL, CVSS 9.8)
+    - Menemukan: Pillow 8.2.0 → CVE-2021-25288 (CRITICAL)
+    - Menemukan: requests 2.25.0 → CVE-2021-33503
+
+  Hasil: Pipeline merah ❌
+
+  Fix:
+    Edit app/requirements.txt:
+      UBAH: Pillow==8.2.0     → Pillow==10.4.0
+      UBAH: requests==2.25.0  → requests==2.31.0
+      UBAH: fastapi==0.68.0   → fastapi==0.111.0
+      UBAH: uvicorn==0.14.0   → uvicorn==0.30.0
+      UBAH: pydantic==1.8.0   → pydantic==2.7.0
+
+  ──────────────────────────────────────────────────────────────────
+  PUSH 4 — Pipeline hijau, ZAP catat temuan tapi tidak blokir
+  ──────────────────────────────────────────────────────────────────
+
+  Kondisi: Semua kode bersih, dependencies di-upgrade
+
+  Yang terjadi:
+    Stage 1: Gitleaks PASS, Semgrep PASS, DepCheck PASS (CVE minimal)
+    Stage 2: Trivy image PASS, Trivy config temukan root+no HEALTHCHECK (MEDIUM)
+    Stage 3: ZAP temukan missing security headers (MEDIUM/LOW)
+    Final:   security-summary.json: passed=true, critical=0, high=0
+
+  Hasil: Pipeline hijau ✅
+
+  Temuan yang tersisa (MEDIUM/LOW, tidak blokir):
+    - Trivy: Container running as root (MEDIUM)
+    - Trivy: No HEALTHCHECK (LOW)
+    - ZAP: Missing X-Content-Type-Options header (LOW)
+    - ZAP: Missing Anti-clickjacking header (MEDIUM)
+
+  Fix opsional untuk Dockerfile:
+    TAMBAH setelah RUN pip install:
+      RUN adduser --disabled-password --no-create-home --uid 1001 appuser
+      USER appuser
+    TAMBAH sebelum EXPOSE:
+      HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+        CMD curl -f http://localhost:8000/health || exit 1
+
+  Fix opsional untuk FastAPI (security headers middleware):
+    Edit app/main.py, tambah setelah deklarasi app:
+      @app.middleware("http")
+      async def add_security_headers(request, call_next):
+          response = await call_next(request)
+          response.headers["X-Content-Type-Options"] = "nosniff"
+          response.headers["X-Frame-Options"] = "DENY"
+          response.headers["X-XSS-Protection"] = "1; mode=block"
+          response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+          response.headers["Content-Security-Policy"] = "default-src 'self'"
+          return response
+
+================================================================================
+  11. CARA MEMPERBAIKI SETIAP JENIS TEMUAN
+================================================================================
+
+  HARDCODED SECRETS (Gitleaks)
+  ─────────────────────────────
+  Masalah: Password/key/token ditulis langsung di kode Python
+  Risk   : Siapapun yang bisa akses repo bisa melihat credential ini
+
+  Fix:
+    1. Hapus nilai dari kode
+    2. Tambahkan ke GitHub Secrets (Settings → Secrets → Actions)
+    3. Di kode, baca dengan: nilai = os.getenv("NAMA_SECRET")
+    4. Di docker-compose/Dockerfile, pass via: -e NAMA_SECRET=$NAMA_SECRET
+    5. JANGAN LUPA: Rotate (ganti) nilai yang sudah bocor karena
+       sudah tersimpan di git history
+
+  SQL INJECTION (Semgrep / ZAP)
+  ───────────────────────────────
+  Masalah: User input digabung langsung ke string SQL
+  Risk   : Penyerang bisa manipulasi query untuk bypass auth atau
+           exfiltrate seluruh database
+
+  Fix:
+    # SALAH (vulnerable)
+    query = f"SELECT * FROM users WHERE id = {user_id}"
+    conn.execute(query)
+
+    # BENAR (parameterized query)
+    conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    # atau dengan named params:
+    conn.execute("SELECT * FROM users WHERE id = :id", {"id": user_id})
+
+  MISSING AUTHENTICATION (Semgrep / ZAP)
+  ────────────────────────────────────────
+  Masalah: Endpoint sensitive dapat diakses tanpa verifikasi identitas
+  Risk   : Siapapun bisa akses data admin, user list, dll
+
+  Fix (FastAPI dengan Depends):
+    from fastapi import Depends, HTTPException, Header
+
+    def verify_token(authorization: str = Header(...)):
+        if authorization != f"Bearer {os.getenv('API_TOKEN')}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    @app.get("/admin")
+    def admin_panel(auth = Depends(verify_token)):  # ← tambah Depends
+        ...
+
+  OUTDATED DEPENDENCIES / CVE (Dependency Check / Trivy)
+  ────────────────────────────────────────────────────────
+  Masalah: Package yang digunakan punya kerentanan yang sudah diketahui
+  Risk   : Bergantung pada CVE — bisa RCE, DoS, info disclosure
+
+  Fix:
+    1. Lihat CVE ID di report (contoh: CVE-2021-25287)
+    2. Cek versi mana yang sudah di-patch di:
+       https://pypi.org/project/Pillow/#history
+       atau https://nvd.nist.gov/vuln/detail/CVE-2021-25287
+    3. Update requirements.txt ke versi aman
+    4. Jalankan: pip install -r requirements.txt
+    5. Jalankan test untuk pastikan tidak ada breaking change
+
+  RUNNING AS ROOT (Trivy config)
+  ────────────────────────────────
+  Masalah: Container berjalan sebagai user root
+  Risk   : Jika ada RCE vulnerability, penyerang dapat akses root
+           pada container (dan potensial escape ke host)
+
+  Fix (tambah ke Dockerfile):
+    RUN adduser --disabled-password --no-create-home --uid 1001 appuser
+    USER appuser
+    # Pastikan file permissions benar sebelum switch user
+
+  MISSING SECURITY HEADERS (ZAP)
+  ────────────────────────────────
+  Masalah: Response HTTP tidak menyertakan header keamanan standar
+  Risk   : Browser tidak tahu batasan keamanan yang diberlakukan server
+
+  Header yang wajib ada:
+    X-Content-Type-Options: nosniff
+      → Cegah browser "sniff" MIME type (mitigasi XSS via file upload)
+
+    X-Frame-Options: DENY
+      → Cegah halaman di-embed dalam iframe (mitigasi clickjacking)
+
+    Strict-Transport-Security: max-age=31536000
+      → Paksa HTTPS (hanya efektif di production dengan HTTPS)
+
+    Content-Security-Policy: default-src 'self'
+      → Batasi sumber daya yang bisa dimuat browser (mitigasi XSS)
+
+  UNRESTRICTED FILE UPLOAD (Semgrep)
+  ────────────────────────────────────
+  Masalah: Endpoint upload menerima semua jenis file tanpa validasi
+  Risk   : Penyerang bisa upload file .php, .py, script berbahaya
+
+  Fix:
+    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/gif", "application/pdf"}
+    MAX_SIZE = 5 * 1024 * 1024  # 5 MB
+
+    async def upload_file(file: UploadFile = File(...)):
+        if file.content_type not in ALLOWED_TYPES:
+            raise HTTPException(400, "File type not allowed")
+        content = await file.read()
+        if len(content) > MAX_SIZE:
+            raise HTTPException(400, "File too large")
+        safe_name = os.path.basename(file.filename)  # cegah path traversal
+        ...
+
+================================================================================
+  12. PERINTAH BERGUNA UNTUK TESTING LOKAL
+================================================================================
+
+  MENJALANKAN APLIKASI LOKAL:
+  ───────────────────────────
+    # Install dependencies
+    pip install -r app/requirements.txt
+
+    # Jalankan server development
+    python -m uvicorn app.main:app --reload --port 8000
+
+    # Akses di browser:
+    # http://localhost:8000/health
+    # http://localhost:8000/docs  (Swagger UI otomatis dari FastAPI)
+    # http://localhost:8000/users
+    # http://localhost:8000/admin
+
+  MENJALANKAN TEST:
+  ─────────────────
+    pip install pytest httpx
+    pytest tests/ -v
+    pytest tests/ -v --tb=short  # output lebih ringkas
+
+  DOCKER COMMANDS:
+  ─────────────────
+    # Build image
+    docker build -t securepipeline-app:local .
+
+    # Jalankan container
+    docker run -d -p 8000:8000 --name sp-local securepipeline-app:local
+
+    # Cek log container
+    docker logs sp-local
+
+    # Stop dan hapus container
+    docker stop sp-local && docker rm sp-local
+
+    # Masuk ke dalam container (untuk debug)
+    docker exec -it sp-local /bin/bash
+
+  SCAN LOKAL (butuh alat terinstall):
+  ─────────────────────────────────────
+    # Semgrep
+    pip install semgrep
+    semgrep --config p/python --config .semgrep.yml app/ -v
+
+    # Gitleaks (download dari https://github.com/gitleaks/gitleaks/releases)
+    gitleaks detect --config .gitleaks.toml --source . -v
+
+    # Trivy (download dari https://github.com/aquasecurity/trivy/releases)
+    trivy image securepipeline-app:local
+    trivy config .
+
+    # OWASP Dependency Check (download dari https://owasp.org/www-project-dependency-check)
+    dependency-check.bat --project SecurePipeline --scan app/ --format JSON
+
+  MENGUJI SQL INJECTION MANUAL:
+  ──────────────────────────────
+    # Jalankan app dulu, lalu coba di browser atau curl:
+
+    # Normal request
+    curl http://localhost:8000/users/1
+
+    # SQL injection attempt (tampilkan semua user)
+    curl "http://localhost:8000/users/1%20OR%201%3D1--"
+    # (URL encoded dari: 1 OR 1=1--)
+
+    # Dengan httpie (lebih mudah dibaca):
+    http GET "http://localhost:8000/users/1 OR 1=1--"
+
+  MENGUJI ENDPOINT TANPA AUTH:
+  ──────────────────────────────
+    # Akses admin tanpa login — harusnya ditolak, tapi tidak
+    curl http://localhost:8000/admin
+
+    # Hasilnya: JSON dengan DB_PASSWORD dan AWS_KEY ter-expose
+    # Ini yang akan ZAP deteksi saat DAST scan
+
+================================================================================
+  13. TROUBLESHOOTING MASALAH UMUM
+================================================================================
+
+  MASALAH: GitHub Actions tidak trigger saat push
+  SOLUSI:
+    - Pastikan file .github/workflows/devsecops.yml ada dan valid YAML
+    - Pastikan repo GitHub sudah diset Public (Actions gratis di public repo)
+    - Cek tab "Actions" → mungkin ada error parsing YAML
+    - Validasi YAML di: https://www.yamllint.com
+
+  MASALAH: Dependency Check gagal / timeout
+  SOLUSI:
+    - OWASP DepCheck butuh download NVD database (bisa lama di first run)
+    - Pipeline sudah set continue-on-error: true untuk DepCheck
+    - Jika terus gagal, coba tambah: --nvdApiKey di args (daftar di nvd.nist.gov)
+
+  MASALAH: ZAP tidak bisa koneksi ke app di staging
+  SOLUSI:
+    - Cek log container staging: docker logs staging
+    - Pastikan app bisa start (cek requirements.txt sudah benar)
+    - Cek apakah port 8000 tidak konflik dengan service lain di runner
+    - Periksa step "Wait for app health check" — berapa attempt yang gagal?
+
+  MASALAH: aggregate_results.py error "file not found"
+  SOLUSI:
+    - Script sudah handle gracefully — file yang tidak ada di-skip
+    - Scanner yang tidak jalan akan tercatat sebagai status: "not_run"
+    - Pastikan artifact di-upload dengan nama yang benar di setiap stage
+
+  MASALAH: Gitleaks flag false positive (mendeteksi sesuatu yang bukan secret)
+  SOLUSI:
+    - Tambahkan ke allowlist di .gitleaks.toml:
+      [allowlist]
+      regexes = ["PATTERN_YANG_BUKAN_SECRET"]
+    - Atau tambahkan komentar inline: # gitleaks:allow
+    - Atau tambahkan path ke allowlist paths
+
+  MASALAH: Semgrep terlalu banyak false positive
+  SOLUSI:
+    - Tambahkan komentar untuk suppress: # nosemgrep: rule-id
+    - Edit .semgrep.yml untuk perkecil scope rule
+    - Tambahkan patterns: pattern-not untuk exclude kasus yang valid
+
+  MASALAH: Trivy muncul CVE yang tidak relevan (unfixed/OS package)
+  SOLUSI:
+    - Tambahkan flag --ignore-unfixed agar hanya tampil CVE yang ada patchnya
+    - Atau buat file .trivyignore dengan CVE ID yang ingin di-suppress:
+      # .trivyignore
+      CVE-2023-XXXXX  # reason: not exploitable in our context
+
+================================================================================
+  14. GLOSSARY / ISTILAH PENTING
+================================================================================
+
+  AST (Abstract Syntax Tree)
+    Representasi struktur kode dalam bentuk tree. Semgrep menggunakan ini
+    untuk memahami kode secara semantis, bukan hanya sebagai teks.
+
+  CI/CD (Continuous Integration / Continuous Delivery)
+    Proses otomasi build, test, dan deploy yang berjalan setiap ada
+    perubahan kode. CI = build+test otomatis, CD = deploy otomatis.
+
+  CVE (Common Vulnerabilities and Exposures)
+    ID standar untuk kerentanan keamanan yang diketahui publik.
+    Format: CVE-TAHUN-NOMOR, contoh: CVE-2021-25287
+    Database resmi: https://nvd.nist.gov
+
+  CVSS (Common Vulnerability Scoring System)
+    Sistem skor 0-10 untuk mengukur severity CVE.
+    0.0-3.9 = Low, 4.0-6.9 = Medium, 7.0-8.9 = High, 9.0-10.0 = Critical
+
+  DAST (Dynamic Application Security Testing)
+    Pengujian keamanan terhadap aplikasi yang SEDANG BERJALAN, dengan
+    mengirim request HTTP nyata dan menganalisis response.
+
+  DevSecOps
+    Metodologi pengembangan software yang mengintegrasikan keamanan (Security)
+    ke dalam proses Development dan Operations sejak awal.
+
+  Docker Image
+    Paket yang berisi aplikasi beserta semua dependensinya, siap dijalankan
+    di environment apapun yang punya Docker.
+
+  False Positive
+    Temuan scanner yang sebenarnya bukan masalah keamanan nyata.
+    Semua scanner punya false positive rate yang perlu dikelola.
+
+  GitHub Actions
+    Platform CI/CD bawaan GitHub yang berjalan di cloud secara gratis
+    untuk public repository (dengan limit tertentu).
+
+  GitHub Secrets
+    Mekanisme penyimpanan nilai sensitif (API key, password) di GitHub
+    yang bisa dibaca oleh pipeline tapi tidak ter-expose di log.
+
+  Hardcoded Secret
+    Nilai credential (API key, password, token) yang ditulis langsung
+    di kode sumber, bukan dibaca dari environment atau config yang aman.
+
+  IaC (Infrastructure as Code)
+    Mendeskripsikan infrastruktur (server, network, container) dalam
+    file kode (Dockerfile, Terraform, K8s YAML) yang bisa di-version control.
+
+  NVD (National Vulnerability Database)
+    Database CVE resmi yang dikelola oleh NIST (lembaga standar AS).
+    Digunakan oleh OWASP Dependency Check sebagai sumber data.
+
+  OWASP (Open Web Application Security Project)
+    Organisasi non-profit yang memproduksi tools, dokumentasi, dan
+    standar untuk keamanan aplikasi web. Terkenal dengan "OWASP Top 10".
+
+  OWASP Top 10
+    Daftar 10 risiko keamanan aplikasi web paling kritis, diupdate
+    setiap beberapa tahun. Menjadi standar referensi industri.
+
+  Parameterized Query
+    Teknik untuk mencegah SQL injection: nilai input dipisahkan dari
+    struktur query SQL menggunakan placeholder (? atau :name).
+
+  Pipeline Gate
+    Kondisi yang harus terpenuhi agar pipeline bisa lanjut ke tahap
+    berikutnya. Di project ini: tidak ada temuan CRITICAL atau HIGH.
+
+  SAST (Static Application Security Testing)
+    Analisis kode sumber TANPA menjalankan kode untuk menemukan pola
+    berbahaya. Lebih cepat dan bisa jalan lebih awal dari DAST.
+
+  SCA (Software Composition Analysis)
+    Analisis komponen pihak ketiga (library, framework) untuk menemukan
+    CVE dalam versi yang digunakan.
+
+  Semgrep Rule
+    Pola yang ditulis dalam sintaks YAML yang mendeskripsikan kode
+    yang ingin dicari (vulnerable atau tidak aman).
+
+  Severity
+    Tingkat keparahan sebuah temuan keamanan:
+    CRITICAL > HIGH > MEDIUM > LOW > INFO
+
+  SQLi (SQL Injection)
+    Serangan di mana penyerang memasukkan kode SQL ke input aplikasi
+    untuk memanipulasi query database yang dieksekusi.
+
+  Trivy
+    Scanner vulnerability open-source dari Aqua Security untuk
+    container image, filesystem, dan konfigurasi IaC.
+
+  XSS (Cross-Site Scripting)
+    Serangan di mana skrip berbahaya disuntikkan ke halaman web dan
+    dieksekusi di browser pengguna lain.
+
+================================================================================
+  SELESAI — PANDUAN LENGKAP SECUREPIPELINE
+================================================================================
+
+  Project ini adalah demonstrasi praktis DevSecOps untuk portfolio
+  cyber security. Semua vulnerability bersifat intentional dan
+  didokumentasikan untuk keperluan edukasi.
+
+  INGAT: Jangan deploy app/main.py yang vulnerable ini ke server produksi.
+
+================================================================================

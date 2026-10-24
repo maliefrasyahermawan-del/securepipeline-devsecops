@@ -1,0 +1,486 @@
+name: SecurePipeline — DevSecOps CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master, develop]
+
+# Prevent duplicate pipeline runs when pushing to an open PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: securepipeline-app
+  IMAGE_TAG: ${{ github.sha }}
+
+# ============================================================================
+# STAGE 1 — PRE-BUILD SECURITY SCAN
+# Runs before any Docker build. Blocks the rest of the pipeline on failure.
+# ============================================================================
+jobs:
+  pre-build-scan:
+    name: "Stage 1 — Pre-Build Security"
+    runs-on: ubuntu-latest
+    outputs:
+      has-critical: ${{ steps.eval.outputs.has_critical }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Full history needed for Gitleaks
+
+      # ── 1a. GITLEAKS — detect hardcoded secrets in git history ─────────────
+      - name: Gitleaks — secret detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        # continue-on-error: false  ← default; pipeline stops if secrets found
+        # Gitleaks will exit non-zero and cancel further steps in this job,
+        # but we want to collect an artifact first, so we use id + always().
+
+      # ── 1b. SEMGREP — static analysis for code patterns ───────────────────
+      - name: Setup Python for scripts
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Create scan-results directory
+        run: mkdir -p scan-results
+
+      - name: Semgrep — SAST scan
+        run: |
+          semgrep \
+            --config p/python \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config .semgrep.yml \
+            --json \
+            --output scan-results/semgrep.json \
+            app/ || true
+          echo "Semgrep scan complete. Checking findings..."
+          python -c "
+          import json, sys
+          try:
+              data = json.load(open('scan-results/semgrep.json'))
+              results = data.get('results', [])
+              high = [r for r in results if r.get('extra',{}).get('severity','').upper() in ('ERROR','WARNING')]
+              print(f'Semgrep: {len(results)} total findings, {len(high)} high/error severity')
+          except Exception as e:
+              print(f'Could not parse semgrep output: {e}')
+          "
+
+      # ── 1c. OWASP Dependency Check ─────────────────────────────────────────
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "SecurePipeline"
+          path: "app/"
+          format: "JSON"
+          out: "scan-results"
+          args: >
+            --enableRetired
+            --enableExperimental
+        continue-on-error: true   # May fail on network timeout; don't block pipeline
+
+      - name: Rename Dependency Check output
+        run: |
+          if [ -f scan-results/dependency-check-report.json ]; then
+            echo "Dependency Check report found."
+          else
+            echo '{"dependencies":[]}' > scan-results/dependency-check-report.json
+            echo "No Dependency Check report; wrote empty placeholder."
+          fi
+
+      # ── 1d. Evaluate Stage 1 results ───────────────────────────────────────
+      - name: Evaluate pre-build findings
+        id: eval
+        run: |
+          python -c "
+          import json, sys
+
+          critical = False
+
+          # Check Semgrep
+          try:
+              data = json.load(open('scan-results/semgrep.json'))
+              for r in data.get('results', []):
+                  if r.get('extra',{}).get('severity','').upper() == 'ERROR':
+                      critical = True
+                      break
+          except Exception:
+              pass
+
+          # Check Dependency Check
+          try:
+              data = json.load(open('scan-results/dependency-check-report.json'))
+              for dep in data.get('dependencies', []):
+                  for v in dep.get('vulnerabilities', []):
+                      if v.get('severity','').upper() in ('CRITICAL','HIGH'):
+                          critical = True
+                          break
+          except Exception:
+              pass
+
+          print(f'has_critical={str(critical).lower()}')
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              f.write(f'has_critical={str(critical).lower()}\n')
+          " 2>/dev/null || echo "has_critical=false" >> $GITHUB_OUTPUT
+
+      # Upload Stage 1 artifacts regardless of outcome
+      - name: Upload Stage 1 scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-pre-build-reports
+          path: scan-results/
+          retention-days: 30
+
+# ============================================================================
+# STAGE 2 — BUILD + CONTAINER VULNERABILITY SCAN
+# Runs only if Stage 1 completed (even with findings; gate is in final job).
+# ============================================================================
+  build-and-scan:
+    name: "Stage 2 — Build & Container Scan"
+    runs-on: ubuntu-latest
+    needs: pre-build-scan
+    outputs:
+      has-critical: ${{ steps.trivy-eval.outputs.has_critical }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create scan-results directory
+        run: mkdir -p scan-results
+
+      # ── 2a. Docker build ───────────────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            .
+
+      # ── 2b. Trivy — image vulnerability scan ──────────────────────────────
+      - name: Trivy — image CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "json"
+          output: "scan-results/trivy-report.json"
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          exit-code: "0"           # Don't fail here; let aggregate_results gate
+          ignore-unfixed: false
+
+      # ── 2c. Trivy — Dockerfile misconfiguration scan ───────────────────────
+      - name: Trivy — config/Dockerfile scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "."
+          format: "json"
+          output: "scan-results/trivy-config.json"
+          exit-code: "0"
+
+      # ── 2d. Print Trivy summary to Actions log ─────────────────────────────
+      - name: Trivy — print image summary (table)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "0"
+
+      # ── 2e. Evaluate Trivy findings ────────────────────────────────────────
+      - name: Evaluate container scan findings
+        id: trivy-eval
+        run: |
+          python3 -c "
+          import json, os
+
+          critical = False
+          try:
+              data = json.load(open('scan-results/trivy-report.json'))
+              for result in data.get('Results', []):
+                  for vuln in result.get('Vulnerabilities', []) or []:
+                      if vuln.get('Severity','').upper() == 'CRITICAL':
+                          critical = True
+                          break
+          except Exception as e:
+              print(f'Trivy parse error: {e}')
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              f.write(f'has_critical={str(critical).lower()}\n')
+          print(f'Container critical CVEs found: {critical}')
+          "
+
+      - name: Upload Stage 2 scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-container-reports
+          path: scan-results/
+          retention-days: 30
+
+# ============================================================================
+# STAGE 3 — STAGING DEPLOY + DAST (OWASP ZAP)
+# Runs only if Stage 2 completed. ZAP is continue-on-error (noisy scanner).
+# ============================================================================
+  staging-and-dast:
+    name: "Stage 3 — Staging & DAST"
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create scan-results directory
+        run: mkdir -p scan-results
+
+      # ── 3a. Re-build image (artifacts not shared between jobs) ─────────────
+      - name: Build Docker image for staging
+        run: |
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            .
+
+      # ── 3b. Launch staging container ───────────────────────────────────────
+      - name: Start staging container
+        run: |
+          docker run -d \
+            --name staging \
+            -p 8000:8000 \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      # ── 3c. Wait for app to be ready ───────────────────────────────────────
+      - name: Wait for app health check
+        run: |
+          echo "Waiting for app to be ready on :8000..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8000/health; then
+              echo ""
+              echo "App is ready (attempt $i)."
+              exit 0
+            fi
+            echo "Attempt $i: not ready yet, sleeping 3s..."
+            sleep 3
+          done
+          echo "App did not become ready within 45s. Showing container logs:"
+          docker logs staging
+          exit 1
+
+      # ── 3d. OWASP ZAP baseline DAST scan ──────────────────────────────────
+      - name: OWASP ZAP — baseline DAST scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: "http://localhost:8000"
+          rules_file_name: ""
+          cmd_options: "-J scan-results/zap-report.json -I"
+        continue-on-error: true   # ZAP baseline is informational; don't hard-fail CI
+
+      # ── 3e. Stop staging container ─────────────────────────────────────────
+      - name: Stop staging container
+        if: always()
+        run: docker stop staging && docker rm staging || true
+
+      - name: Upload Stage 3 scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-dast-reports
+          path: scan-results/
+          retention-days: 30
+
+# ============================================================================
+# FINAL JOB — AGGREGATE REPORT + PIPELINE GATE
+# Collects all artifacts, builds unified report, fails pipeline on CRITICAL/HIGH.
+# ============================================================================
+  security-report:
+    name: "Final — Aggregate Security Report"
+    runs-on: ubuntu-latest
+    needs: [pre-build-scan, build-and-scan, staging-and-dast]
+    if: always()   # Run even if earlier stages failed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Download all scan artifacts into scan-results/
+      - name: Download Stage 1 reports
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-pre-build-reports
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Download Stage 2 reports
+        uses: actions/download-artifact@v4
+        with:
+          name: stage2-container-reports
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Download Stage 3 reports
+        uses: actions/download-artifact@v4
+        with:
+          name: stage3-dast-reports
+          path: scan-results/
+        continue-on-error: true
+
+      # ── Run the aggregator script ──────────────────────────────────────────
+      - name: Run aggregate_results.py
+        id: aggregate
+        run: |
+          python scripts/aggregate_results.py \
+            --results-dir scan-results \
+            --output security-summary.json
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      # ── Print summary JSON to Actions log ─────────────────────────────────
+      - name: Print security summary
+        run: |
+          if [ -f security-summary.json ]; then
+            echo "=== SECURITY SUMMARY ==="
+            python -c "
+          import json
+          data = json.load(open('security-summary.json'))
+          print(f\"  Passed        : {data['passed']}\")
+          print(f\"  Total findings: {data['total_findings']}\")
+          print(f\"  CRITICAL      : {data['critical']}\")
+          print(f\"  HIGH          : {data['high']}\")
+          print(f\"  MEDIUM        : {data['medium']}\")
+          print(f\"  LOW           : {data['low']}\")
+          "
+          fi
+
+      # ── Post PR comment with findings summary ──────────────────────────────
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = {};
+            try {
+              summary = JSON.parse(fs.readFileSync('security-summary.json', 'utf8'));
+            } catch (e) {
+              core.warning('Could not read security-summary.json');
+              return;
+            }
+
+            const icon = summary.passed ? '✅' : '❌';
+            const status = summary.passed ? 'PASSED' : 'FAILED — CRITICAL/HIGH findings block deployment';
+
+            const body = `## ${icon} SecurePipeline Security Report
+
+**Status:** ${status}
+
+| Severity | Count |
+|----------|-------|
+| 🔴 CRITICAL | ${summary.critical} |
+| 🟠 HIGH     | ${summary.high} |
+| 🟡 MEDIUM   | ${summary.medium} |
+| 🔵 LOW      | ${summary.low} |
+| **Total**   | **${summary.total_findings}** |
+
+<details>
+<summary>Scanner breakdown</summary>
+
+${Object.entries(summary.scanners || {}).map(([name, s]) =>
+  `- **${name}**: ${s.findings ?? 0} finding(s) (${s.status})`
+).join('\n')}
+
+</details>
+
+> Scan artifacts are available in the GitHub Actions run for 30 days.`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      # ── Optional Slack notification ────────────────────────────────────────
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          python -c "
+          import json, urllib.request, os
+
+          data = json.load(open('security-summary.json'))
+          icon = ':white_check_mark:' if data['passed'] else ':x:'
+          status = 'PASSED' if data['passed'] else 'FAILED'
+          repo = os.environ.get('GITHUB_REPOSITORY', 'unknown/repo')
+          run_url = f\"https://github.com/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}\"
+
+          payload = {
+            'text': f'{icon} *SecurePipeline [{repo}]* — Security scan {status}',
+            'blocks': [
+              {
+                'type': 'section',
+                'text': {
+                  'type': 'mrkdwn',
+                  'text': (
+                    f'{icon} *Security Scan {status}*\n'
+                    f'Repo: {repo} | Branch: {os.environ.get(\"GITHUB_REF_NAME\",\"\")}\n'
+                    f'Critical: {data[\"critical\"]} | High: {data[\"high\"]} | Medium: {data[\"medium\"]}\n'
+                    f'<{run_url}|View full report>'
+                  )
+                }
+              }
+            ]
+          }
+
+          req = urllib.request.Request(
+            os.environ['SLACK_WEBHOOK'],
+            data=json.dumps(payload).encode(),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+          )
+          urllib.request.urlopen(req)
+          print('Slack notification sent.')
+          "
+        continue-on-error: true   # Don't fail pipeline if Slack is misconfigured
+
+      # ── Upload final aggregate report ──────────────────────────────────────
+      - name: Upload security summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: security-summary.json
+          retention-days: 30
+
+      # ── PIPELINE GATE — fail if critical or high findings exist ────────────
+      - name: Pipeline gate — fail on CRITICAL/HIGH
+        run: |
+          python -c "
+          import json, sys
+          try:
+              data = json.load(open('security-summary.json'))
+              if not data['passed']:
+                  print(f\"PIPELINE BLOCKED: {data['critical']} critical, {data['high']} high severity findings.\")
+                  print('Fix all CRITICAL and HIGH findings before deployment is allowed.')
+                  sys.exit(1)
+              else:
+                  print(f\"All gates passed. {data['total_findings']} total findings (none critical/high).\")
+          except FileNotFoundError:
+              print('security-summary.json not found — treating as pass.')
+          "

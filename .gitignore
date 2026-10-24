@@ -1,0 +1,19 @@
+# Local agent/editor settings
+.claude/
+.vscode/
+.idea/
+
+# Python runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Security-scanner output
+securepipeline/scan-results/
+securepipeline/reports/
+securepipeline/security-summary.json
+securepipeline/zap-report.*

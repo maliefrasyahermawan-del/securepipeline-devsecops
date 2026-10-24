@@ -1,0 +1,15 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+tests/
+scripts/
+*.md
+.gitleaks.toml
+.semgrep.yml
+scan-results/
+security-summary.json

@@ -1,0 +1,104 @@
+# Custom Semgrep rules for SecurePipeline
+# These extend the standard p/python and p/security-audit rulesets.
+# Run locally: semgrep --config .semgrep.yml app/
+
+rules:
+
+  - id: fastapi-missing-auth-dependency
+    patterns:
+      - pattern: |
+          @$APP.get("$ROUTE")
+          def $FUNC(...):
+              ...
+      - pattern-not: |
+          @$APP.get("$ROUTE")
+          def $FUNC(..., $DEP = Depends(...), ...):
+              ...
+      - metavariable-regex:
+          metavariable: $ROUTE
+          regex: ^/(admin|dashboard|internal|manage)
+    message: >
+      FastAPI route '$ROUTE' appears to be an admin/privileged endpoint but has
+      no Depends() authentication guard. Add an auth dependency or restrict access.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: CWE-306
+      owasp: A01:2021
+
+  - id: sqlite3-string-format-sqli
+    patterns:
+      - pattern: $CONN.execute(f"...{$VAR}...")
+      - pattern-not: $CONN.execute(f"...{$VAR}...", (...))
+    message: >
+      Possible SQL injection: f-string used to build a SQL query. Use parameterized
+      queries with ? placeholders and pass values as a tuple to .execute().
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: CWE-89
+      owasp: A03:2021
+
+  - id: string-concat-sqli
+    patterns:
+      - pattern: $CONN.execute("..." + $VAR + "...")
+    message: >
+      SQL query built with string concatenation — SQL injection risk.
+      Use parameterized queries instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: CWE-89
+      owasp: A03:2021
+
+  - id: plaintext-password-comparison
+    patterns:
+      - pattern: |
+          WHERE username = ? AND password = ?
+    message: >
+      Passwords appear to be stored and compared in plain text.
+      Use a password hashing library (bcrypt, argon2-cffi) to store password hashes.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: CWE-256
+      owasp: A02:2021
+
+  - id: unrestricted-file-upload
+    patterns:
+      - pattern: |
+          async def $FUNC($FILE: UploadFile = File(...)):
+              ...
+              open($DEST, "wb") as $F:
+                  ...
+      - pattern-not: |
+          async def $FUNC($FILE: UploadFile = File(...)):
+              ...
+              if $FILE.content_type not in ...:
+                  ...
+    message: >
+      File upload handler does not validate content_type or file extension.
+      Restrict allowed types to prevent executable file uploads.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: CWE-434
+      owasp: A04:2021
+
+  - id: os-path-join-user-input
+    patterns:
+      - pattern: os.path.join($BASE, $FILE.filename)
+    message: >
+      Path constructed from user-supplied filename — potential path traversal.
+      Sanitize the filename with os.path.basename() before joining.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: CWE-22
+      owasp: A01:2021

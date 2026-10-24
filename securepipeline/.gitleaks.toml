@@ -1,0 +1,55 @@
+# Gitleaks v8 configuration
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+title = "SecurePipeline Gitleaks Config"
+
+[extend]
+# Extend the default ruleset shipped with Gitleaks
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules — added on top of the default set
+# ---------------------------------------------------------------------------
+[[rules]]
+id          = "generic-db-password"
+description = "Detects generic DB_PASSWORD variable assignments with values"
+regex       = '''(?i)(db_password|database_password|db_pass)\s*=\s*["']?[A-Za-z0-9!@#$%^&*]{6,}["']?'''
+tags        = ["secret", "database"]
+
+[[rules]]
+id          = "hardcoded-secret-token"
+description = "Detects variables named SECRET or TOKEN with hardcoded values"
+regex       = '''(?i)(secret|token|api_key|secret_key)\s*=\s*["'][A-Za-z0-9_\-]{8,}["']'''
+tags        = ["secret", "credential"]
+
+[[rules]]
+id          = "generic-password-assignment"
+description = "Detects PASSWORD = '...' patterns in Python source"
+regex       = '''(?i)password\s*=\s*["'][^"']{4,}["']'''
+tags        = ["secret", "password"]
+
+# ---------------------------------------------------------------------------
+# Allowlist — paths and patterns that should NOT trigger alerts
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Allowlisted paths and commit patterns"
+
+# Allow test fixture files that intentionally contain fake credentials
+paths = [
+    "tests/",
+    ".*\\.test\\.py$",
+    ".*\\.spec\\.py$",
+]
+
+# Allow known-fake example values used in documentation
+regexes = [
+    # AWS example key published by Amazon as a non-secret example
+    "AKIAIOSFODNN7EXAMPLE",
+    # Generic placeholder patterns
+    "YOUR_.*_HERE",
+    "REPLACE_ME",
+    "<YOUR_",
+]
+
+# Allow commits authored by bots / CI
+commits = []
